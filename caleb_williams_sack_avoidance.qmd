@@ -1,0 +1,1266 @@
+---
+title: "Caleb Williams: Sack Avoidance Projection"
+subtitle: "A Bayesian Hierarchical AR(1) Model"
+author: "Asa Arnold | University of Notre Dame | M.S. Business Analytics"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    embed-resources: true
+    fig-width: 10
+    fig-height: 6
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This project builds a **Bayesian hierarchical AR(1) model** to estimate Caleb
+Williams' true sack avoidance skill and project his 2026 pressure-to-sack rate
+(P2S). P2S — the fraction of defensive pressures that result in a sack — is a
+QB-controlled outcome that isolates pocket awareness and escapability from
+offensive line quality.
+
+**Why Bayesian and hierarchical?** With only two seasons of data on Caleb, a
+naive point estimate is unreliable. Partial pooling shrinks his estimates toward
+the population of 100 qualifying QBs, borrowing strength from similar players
+while respecting his individual data.
+
+**Why AR(1)?** The previous season's P2S rate enters as a predictor, letting
+the population data answer how persistent sack avoidance skill actually is
+year-to-year — rather than assuming persistence.
+
+**Key finding:** The data reveals that P2S rate is largely noise year-to-year
+once stable between-player differences are controlled (lag coefficient ≈ 0,
+P(β > 0) = 14%). Caleb's historic Year 1→Year 2 improvement (−18.6 pp, 3.3
+SDs below the mean change) is treated partly as signal and partly as noise.
+His estimated true talent is **~13%** — meaningfully below the population mean
+of ~18.7%, suggesting genuine elite-level sack avoidance.
+
+---
+
+# 1. Setup
+
+```{r setup}
+#| label: setup
+
+# To install required packages on first run, uncomment the lines below:
+# install.packages(c("tidyverse", "nflreadr", "brms", "tidybayes",
+#                    "bayesplot", "posterior", "stringdist", "scales"))
+# install.packages("cmdstanr", repos = c("https://mc-stan.org/r-packages/",
+#                                         getOption("repos")))
+# cmdstanr::install_cmdstan()
+
+library(tidyverse)
+library(nflreadr)
+library(brms)
+library(tidybayes)
+library(bayesplot)
+library(posterior)
+library(stringdist)
+library(scales)
+
+options(nflreadr.verbose = FALSE)
+
+if (requireNamespace("cmdstanr", quietly = TRUE) &&
+    nzchar(Sys.getenv("CMDSTAN"))) {
+  options(brms.backend = "cmdstanr")
+} else {
+  options(brms.backend = "rstan")
+}
+```
+
+---
+
+# 2. Configuration
+
+```{r config}
+#| label: config
+
+# ── File paths ────────────────────────────────────────────────────────────────
+# Update BASE_DIR to wherever your PFF passing summary CSVs are stored.
+BASE_DIR <- "C:/Users/asaar/Downloads/PFF QB Data"
+SEASONS  <- 2018:2025
+
+pff_path <- function(season) {
+  file.path(BASE_DIR, paste0("passing_summary_", season, ".csv"))
+}
+
+# ── Inclusion thresholds ──────────────────────────────────────────────────────
+DROPBACK_THRESHOLD     <- 150L   # minimum dropbacks to qualify for the panel
+STARTER_SNAP_THRESHOLD <- 400L   # minimum passing snaps to count as a starter season
+
+# ── Model settings ────────────────────────────────────────────────────────────
+CALEB_ID    <- 144622L
+RANDOM_SEED <- 42L
+N_ITER      <- 3000L
+N_WARMUP    <- 1000L
+N_CHAINS    <- 4L
+ADAPT_DELTA <- 0.95   # slightly conservative; helps with hierarchical geometry
+
+cat(glue::glue(
+  "Seasons: {min(SEASONS)}–{max(SEASONS)} | ",
+  "Dropback threshold: {DROPBACK_THRESHOLD} | ",
+  "Starter snap threshold: {STARTER_SNAP_THRESHOLD}\n"
+))
+```
+
+---
+
+# 3. Data Ingestion and Cleaning
+
+## 3.1 Load PFF Passing Summaries
+
+```{r load-pff}
+#| label: load-pff
+
+load_pff_season <- function(season) {
+  path <- pff_path(season)
+  if (!file.exists(path)) {
+    warning(sprintf("File not found for season %d — skipping: %s", season, path))
+    return(NULL)
+  }
+  read_csv(path, show_col_types = FALSE) |>
+    mutate(
+      season        = season,
+      scramble_rate = scrambles / dropbacks
+    )
+}
+
+raw_panel <- map(SEASONS, load_pff_season) |>
+  compact() |>
+  list_rbind()
+
+cat(sprintf("Raw panel: %d rows across %d seasons\n",
+            nrow(raw_panel), n_distinct(raw_panel$season)))
+```
+
+## 3.2 Filter to Qualifying QB-Seasons
+
+```{r filter-panel}
+#| label: filter-panel
+
+panel <- raw_panel |>
+  filter(
+    position         == "QB",
+    dropbacks        >= DROPBACK_THRESHOLD,
+    !is.na(pressure_to_sack_rate),
+    def_gen_pressures > 0
+  ) |>
+  arrange(player_id, season)
+
+cat(sprintf(
+  "Qualifying panel: %d QB-seasons across %d seasons (%d unique QBs)\n",
+  nrow(panel), n_distinct(panel$season), n_distinct(panel$player_id)
+))
+
+panel |>
+  count(season, name = "n_qbs") |>
+  pivot_wider(names_from = season, values_from = n_qbs) |>
+  print()
+```
+
+---
+
+# 4. Career Stage Features
+
+## 4.1 Draft Year via nflreadr
+
+```{r load-draft}
+#| label: load-draft
+
+draft_picks <- load_players() |>
+  as_tibble() |>
+  filter(position == "QB") |>
+  mutate(
+    draft_season = coalesce(as.integer(draft_year), as.integer(rookie_season))
+  ) |>
+  filter(!is.na(draft_season), !is.na(display_name)) |>
+  select(draft_name = display_name, draft_season) |>
+  distinct(draft_name, .keep_all = TRUE)
+
+cat(sprintf("QB career-start pool: %d players\n", nrow(draft_picks)))
+```
+
+## 4.2 Fuzzy Name Join (PFF ↔ nflverse)
+
+PFF and nflverse do not share a common player ID, so we join on player name
+using Jaro-Winkler string distance — a standard approach for short proper names.
+
+```{r fuzzy-join}
+#| label: fuzzy-join
+
+pff_names   <- unique(panel$player)
+draft_names <- draft_picks$draft_name
+dist_mat    <- stringdistmatrix(pff_names, draft_names, method = "jw")
+
+match_records <- map_dfr(seq_along(pff_names), function(i) {
+  best_j    <- which.min(dist_mat[i, ])
+  best_dist <- dist_mat[i, best_j]
+  tibble(
+    player       = pff_names[i],
+    draft_season = if (best_dist <= 0.12) draft_picks$draft_season[best_j] else NA_integer_,
+    match_dist   = best_dist
+  )
+})
+
+unmatched <- filter(match_records, is.na(draft_season))
+if (nrow(unmatched) > 0) {
+  cat(sprintf(
+    "WARNING: %d player(s) unmatched — excluded from modeling:\n", nrow(unmatched)
+  ))
+  print(select(unmatched, player, match_dist))
+} else {
+  cat("All players matched successfully.\n")
+}
+
+panel <- panel |>
+  left_join(select(match_records, player, draft_season), by = "player")
+```
+
+## 4.3 Career Year and Starter Year
+
+```{r career-stages}
+#| label: career-stages
+
+panel <- panel |>
+  mutate(career_year = season - draft_season + 1L) |>
+  arrange(player_id, season) |>
+  group_by(player_id) |>
+  mutate(
+    is_starter_season = as.integer(passing_snaps >= STARTER_SNAP_THRESHOLD),
+    starter_year      = lag(cumsum(is_starter_season), n = 1L, default = 0L) + 1L
+  ) |>
+  ungroup()
+
+# Sanity check on Caleb
+panel |>
+  filter(player_id == CALEB_ID) |>
+  select(player, season, career_year, starter_year, dropbacks, sacks,
+         def_gen_pressures, pressure_to_sack_rate, avg_time_to_throw,
+         scramble_rate) |>
+  print()
+```
+
+---
+
+# 5. Exploratory Data Analysis
+
+## 5.1 Population Distribution of P2S Rate
+
+```{r eda-distribution}
+#| label: eda-distribution
+#| fig-cap: "League-wide P2S rate distribution (2018–2025). Caleb's Year 1 (red) was well above average; Year 2 (green) is elite."
+
+pop_mean <- mean(panel$pressure_to_sack_rate)
+pop_sd   <- sd(panel$pressure_to_sack_rate)
+
+caleb_vals <- panel |>
+  filter(player_id == CALEB_ID) |>
+  select(season, pressure_to_sack_rate) |>
+  arrange(season)
+
+ggplot(panel, aes(x = pressure_to_sack_rate)) +
+  geom_histogram(bins = 30, fill = "#1a3a5c", alpha = 0.75,
+                 color = "white", linewidth = 0.3) +
+  geom_vline(xintercept = pop_mean, color = "gold",
+             linewidth = 1.2, linetype = "dashed") +
+  annotate("text", x = pop_mean + 0.4, y = Inf,
+           label = sprintf("League mean: %.1f%%", pop_mean),
+           hjust = 0, vjust = 1.5, color = "gold",
+           size = 3.5, fontface = "bold") +
+  geom_vline(xintercept = caleb_vals$pressure_to_sack_rate[1],
+             color = "#e84855", linewidth = 1.4) +
+  annotate("text",
+           x    = caleb_vals$pressure_to_sack_rate[1] + 0.4, y = Inf,
+           label = sprintf("Caleb 2024: %.1f%%",
+                           caleb_vals$pressure_to_sack_rate[1]),
+           hjust = 0, vjust = 3.0, color = "#e84855",
+           size = 3.5, fontface = "bold") +
+  geom_vline(xintercept = caleb_vals$pressure_to_sack_rate[2],
+             color = "#3bb273", linewidth = 1.4) +
+  annotate("text",
+           x    = caleb_vals$pressure_to_sack_rate[2] + 0.4, y = Inf,
+           label = sprintf("Caleb 2025: %.1f%%",
+                           caleb_vals$pressure_to_sack_rate[2]),
+           hjust = 0, vjust = 4.5, color = "#3bb273",
+           size = 3.5, fontface = "bold") +
+  labs(
+    x     = "Pressure-to-Sack Rate (%)",
+    y     = "Count of QB-Seasons",
+    title = "Population Distribution of Pressure-to-Sack Rate (2018–2025)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+```
+
+## 5.2 QB Career Trajectories
+
+```{r eda-trajectories}
+#| label: eda-trajectories
+#| fig-cap: "P2S rate by career year. Caleb's two-season swing is among the most extreme in the dataset."
+
+multi_qbs  <- panel |> count(player_id) |> filter(n >= 3) |> pull(player_id)
+pop_traj   <- panel |>
+  group_by(career_year) |>
+  summarise(mean_p2s = mean(pressure_to_sack_rate), n = n(), .groups = "drop") |>
+  filter(n >= 5)
+caleb_traj <- filter(panel, player_id == CALEB_ID)
+
+ggplot() +
+  geom_line(
+    data = filter(panel, player_id %in% multi_qbs),
+    aes(x = career_year, y = pressure_to_sack_rate, group = player_id),
+    color = "#aaaaaa", linewidth = 0.4, alpha = 0.3
+  ) +
+  geom_line(data = pop_traj, aes(x = career_year, y = mean_p2s),
+            color = "gold", linewidth = 1.8, linetype = "dashed") +
+  geom_line(data = caleb_traj,
+            aes(x = career_year, y = pressure_to_sack_rate),
+            color = "#e84855", linewidth = 2.0) +
+  geom_point(data = caleb_traj,
+             aes(x = career_year, y = pressure_to_sack_rate),
+             color = "#e84855", size = 3.5) +
+  geom_text(data = caleb_traj,
+            aes(x = career_year, y = pressure_to_sack_rate,
+                label = sprintf("%d: %.1f%%", season, pressure_to_sack_rate)),
+            nudge_x = 0.15, nudge_y = 0.5, hjust = 0,
+            color = "#e84855", size = 3.2, fontface = "bold") +
+  scale_x_continuous(breaks = breaks_width(1)) +
+  labs(
+    x        = "Career Year (seasons since draft)",
+    y        = "Pressure-to-Sack Rate (%)",
+    title    = "QB Career Trajectories: Pressure-to-Sack Rate by Career Year",
+    subtitle = "Grey = all QBs | Gold dashed = league mean | Red = Caleb Williams"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+```
+
+## 5.3 Year-over-Year P2S Changes
+
+The distribution of season-over-season P2S changes motivates the AR(1)
+model structure. A wide, near-zero-mean distribution suggests the metric
+is noisy year-to-year — strong shrinkage back toward the mean is expected.
+
+```{r eda-yoy}
+#| label: eda-yoy
+#| fig-cap: "Year-over-year P2S changes across the QB population. Caleb's -18.6 pp improvement is 3.3 standard deviations from the mean — one of the most extreme swings in the 8-year dataset."
+
+yoy_changes <- panel |>
+  arrange(player_id, season) |>
+  group_by(player_id) |>
+  mutate(
+    p2s_lag    = lag(pressure_to_sack_rate),
+    p2s_change = pressure_to_sack_rate - p2s_lag
+  ) |>
+  ungroup() |>
+  filter(!is.na(p2s_lag))
+
+caleb_yoy <- filter(yoy_changes, player_id == CALEB_ID)
+yoy_sd    <- sd(yoy_changes$p2s_change)
+caleb_z   <- caleb_yoy$p2s_change / yoy_sd
+lag1_cor  <- cor(yoy_changes$p2s_lag, yoy_changes$pressure_to_sack_rate)
+
+cat(sprintf(
+  "YoY transitions: %d across %d QBs\n  Mean change : %.2f pp\n  SD change   : %.2f pp\n  Caleb Y1→Y2: %.1f pp  (%.1f SDs from zero)\n  Lag-1 r     : %.3f\n",
+  nrow(yoy_changes), n_distinct(yoy_changes$player_id),
+  mean(yoy_changes$p2s_change), yoy_sd,
+  caleb_yoy$p2s_change, caleb_z, lag1_cor
+))
+
+ggplot(yoy_changes, aes(x = p2s_change)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 40,
+                 fill = "#1a3a5c", alpha = 0.75,
+                 color = "white", linewidth = 0.3) +
+  geom_vline(xintercept = 0, color = "gold",
+             linewidth = 1.0, linetype = "dashed") +
+  geom_vline(xintercept = caleb_yoy$p2s_change,
+             color = "#e84855", linewidth = 1.4) +
+  annotate("text",
+           x     = caleb_yoy$p2s_change - 0.3, y = Inf,
+           label = sprintf("Caleb Y1→Y2\n%.1f pp (%.1f σ)",
+                           caleb_yoy$p2s_change, caleb_z),
+           hjust = 1, vjust = 1.4, color = "#e84855",
+           size = 3.5, fontface = "bold") +
+  labs(
+    x        = "Season-over-Season Change in P2S Rate (pp)",
+    y        = "Density",
+    title    = "Year-over-Year P2S Rate Changes (2018–2025)",
+    subtitle = "Gold = no change | Red = Caleb Williams Year 1 → Year 2"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## 5.4 Lag-1 Persistence Scatter
+
+```{r eda-lag-scatter}
+#| label: eda-lag-scatter
+#| fig-cap: "Prior-season P2S rate vs. current-season P2S rate. The OLS slope (~0.31) is the raw persistence signal before the model controls for between-player differences."
+
+ggplot(yoy_changes, aes(x = p2s_lag, y = pressure_to_sack_rate)) +
+  geom_point(color = "#1a3a5c", alpha = 0.4, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "gold",
+              linewidth = 1.2, fill = "gold", alpha = 0.15) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey50", linewidth = 0.8) +
+  geom_point(data = caleb_yoy,
+             aes(x = p2s_lag, y = pressure_to_sack_rate),
+             color = "#e84855", size = 5) +
+  geom_text(data = caleb_yoy,
+            aes(x = p2s_lag, y = pressure_to_sack_rate,
+                label = "Caleb\nY1→Y2"),
+            nudge_x = 0.5, nudge_y = -1.5, hjust = 0,
+            color = "#e84855", size = 3, fontface = "bold") +
+  labs(
+    x        = "P2S Rate: Prior Season (%)",
+    y        = "P2S Rate: Current Season (%)",
+    title    = "Lag-1 Persistence of QB Pressure-to-Sack Rate",
+    subtitle = sprintf(
+      "Gold line = OLS fit (slope ≈ %.2f) | Dashed = perfect persistence",
+      lag1_cor
+    )
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+# 6. Model Dataset
+
+Each QB-season requires a valid prior-season P2S observation to serve as the
+AR(1) lag. This means every QB's first qualifying season is dropped from the
+modeling sample — it provides the lag for their second season. QBs with only
+one qualifying season are excluded.
+
+```{r build-model-df}
+#| label: build-model-df
+
+# Compute lags and within-player TTT change
+panel_lagged <- panel |>
+  arrange(player_id, season) |>
+  group_by(player_id) |>
+  mutate(
+    p2s_lag   = lag(pressure_to_sack_rate),
+    delta_ttt = avg_time_to_throw - lag(avg_time_to_throw)
+  ) |>
+  ungroup()
+
+# Drop first seasons (no lag available) and rows with missing covariates
+model_df <- panel_lagged |>
+  drop_na(p2s_lag, draft_season, career_year, starter_year,
+          avg_time_to_throw, scramble_rate, delta_ttt) |>
+  mutate(trials_col = def_gen_pressures)
+
+# Standardize all continuous covariates and store scaling params
+covariates <- c("p2s_lag", "avg_time_to_throw", "scramble_rate",
+                "career_year", "starter_year", "delta_ttt")
+
+scale_params <- map(covariates, ~ {
+  list(mu = mean(model_df[[.x]]), sig = sd(model_df[[.x]]))
+}) |> set_names(covariates)
+
+for (col in covariates) {
+  model_df[[paste0(col, "_std")]] <-
+    (model_df[[col]] - scale_params[[col]]$mu) / scale_params[[col]]$sig
+}
+
+cat(sprintf(
+  "Model dataset: %d QB-seasons, %d unique QBs\nCaleb Williams present: %s\n",
+  nrow(model_df), n_distinct(model_df$player),
+  if (any(model_df$player_id == CALEB_ID)) "YES" else "NO — CHECK PLAYER ID"
+))
+
+# Caleb's entry in the model dataset
+model_df |>
+  filter(player_id == CALEB_ID) |>
+  select(player, season, career_year, p2s_lag, pressure_to_sack_rate,
+         avg_time_to_throw, delta_ttt, scramble_rate) |>
+  print()
+
+# Expose scaling constants for projection
+sp       <- scale_params
+LAG_MU   <- sp$p2s_lag$mu;          LAG_SIG  <- sp$p2s_lag$sig
+TTT_MU   <- sp$avg_time_to_throw$mu; TTT_SIG  <- sp$avg_time_to_throw$sig
+SCR_MU   <- sp$scramble_rate$mu;     SCR_SIG  <- sp$scramble_rate$sig
+CYR_MU   <- sp$career_year$mu;       CYR_SIG  <- sp$career_year$sig
+SYR_MU   <- sp$starter_year$mu;      SYR_SIG  <- sp$starter_year$sig
+DTTT_MU  <- sp$delta_ttt$mu;         DTTT_SIG <- sp$delta_ttt$sig
+```
+
+---
+
+# 7. Bayesian Hierarchical AR(1) Model
+
+## 7.1 Specification
+
+The model is a Binomial hierarchical GLM fit via `brms` (backed by Stan).
+Partial pooling via player-level random intercepts borrows strength across
+100 QBs while respecting individual data.
+
+**Likelihood:**
+$$\text{sacks}_{i,t} \sim \text{Binomial}(n_{i,t},\; \text{logit}^{-1}(\eta_{i,t}))$$
+
+**Linear predictor:**
+$$\eta_{i,t} = \alpha_{\text{QB}_i} + \beta_\text{lag}\,\tilde{p}_{i,t-1} + \beta_{\Delta\text{ttt}}\,\widetilde{\Delta\text{ttt}}_{i,t} + \beta_\text{ttt}\,\tilde{x}_\text{ttt} + \beta_\text{scr}\,\tilde{x}_\text{scr} + \beta_\text{cyr}\,\tilde{x}_\text{cyr} + \beta_\text{syr}\,\tilde{x}_\text{syr}$$
+
+**Priors:**
+
+| Parameter | Prior | Rationale |
+|:---|:---|:---|
+| Intercept ($\mu_\text{pop}$) | $\mathcal{N}(-1.5,\, 0.3)$ | Logit(0.18) ≈ −1.51; anchors to observed mean P2S |
+| All $\beta$s | $\mathcal{N}(0,\, 0.5)$ | Permissive; lets data identify effect sizes |
+| $\sigma_\text{pop}$ (between-QB SD) | HalfNormal$(0,\, 0.2)$ | ~4–5 pp spread at +1 SD; matches observed variation |
+
+```{r model-spec}
+#| label: model-spec
+
+sack_formula <- bf(
+  sacks | trials(trials_col) ~
+    p2s_lag_std +
+    delta_ttt_std +
+    avg_time_to_throw_std +
+    scramble_rate_std +
+    career_year_std +
+    starter_year_std +
+    (1 | player)
+)
+
+sack_priors <- c(
+  prior(normal(-1.5, 0.3), class = "Intercept"),
+  prior(normal(0, 0.5),    class = "b"),
+  prior(normal(0, 0.2),    class = "sd")
+)
+```
+
+## 7.2 Prior Predictive Check
+
+```{r prior-predictive}
+#| label: prior-predictive
+#| fig-cap: "Prior predictive check — the prior generates P2S rates concentrated in the realistic 5%–40% range before seeing any data."
+#| results: hide
+
+prior_fit <- suppressWarnings(brm(
+  formula      = sack_formula,
+  data         = model_df,
+  family       = binomial(link = "logit"),
+  prior        = sack_priors,
+  sample_prior = "only",
+  iter         = 1000,
+  warmup       = 500,
+  chains       = 2,
+  cores        = 2,
+  seed         = RANDOM_SEED,
+  silent       = 2
+))
+
+tibble(
+  p2s = as.vector(posterior_predict(prior_fit) / model_df$trials_col) * 100
+) |>
+  filter(p2s >= 0, p2s <= 100) |>
+  ggplot(aes(x = p2s)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50,
+                 fill = "#1a3a5c", alpha = 0.7,
+                 color = "white", linewidth = 0.2) +
+  geom_vline(xintercept = pop_mean, color = "gold",
+             linewidth = 1.2, linetype = "dashed") +
+  annotate("text", x = pop_mean + 0.5, y = Inf,
+           label = sprintf("Observed mean: %.1f%%", pop_mean),
+           hjust = 0, vjust = 1.5, color = "gold",
+           size = 3.5, fontface = "bold") +
+  coord_cartesian(xlim = c(0, 60)) +
+  labs(
+    x        = "Simulated Pressure-to-Sack Rate (%)",
+    y        = "Density",
+    title    = "Prior Predictive Check",
+    subtitle = "Distribution should be centered in the realistic 5%–40% range"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## 7.3 MCMC Sampling
+
+```{r sampling}
+#| label: sampling
+#| cache: true
+#| results: hide
+
+fit <- suppressWarnings(brm(
+  formula   = sack_formula,
+  data      = model_df,
+  family    = binomial(link = "logit"),
+  prior     = sack_priors,
+  iter      = N_ITER,
+  warmup    = N_WARMUP,
+  chains    = N_CHAINS,
+  cores     = N_CHAINS,
+  control   = list(adapt_delta = ADAPT_DELTA),
+  seed      = RANDOM_SEED,
+  silent    = 2,
+  save_pars = save_pars(all = TRUE)
+))
+```
+
+```{r sampling-summary}
+#| label: sampling-summary
+
+cat("Sampling complete.\n\n")
+summary(fit, robust = TRUE)
+```
+
+---
+
+# 8. Convergence Diagnostics
+
+All parameters must satisfy R-hat < 1.01 and ESS ratio > 0.10 for convergence
+to be declared. Zero divergent transitions confirms the sampler explored the
+posterior geometry without pathological behavior.
+
+```{r convergence}
+#| label: convergence
+
+rhat_vals <- rhat(fit)
+ess_vals  <- neff_ratio(fit)
+
+pop_params <- c(
+  "b_Intercept", "b_p2s_lag_std", "b_delta_ttt_std",
+  "b_avg_time_to_throw_std", "b_scramble_rate_std",
+  "b_career_year_std", "b_starter_year_std", "sd_player__Intercept"
+)
+
+cat("R-hat (target < 1.01):\n")
+walk(pop_params, ~ cat(sprintf(
+  "  %-35s %.4f  [%s]\n", .x, rhat_vals[.x],
+  if (!is.na(rhat_vals[.x]) && rhat_vals[.x] < 1.01) "OK" else "ISSUE"
+)))
+
+rhat_re_max <- max(rhat_vals[grepl("r_player", names(rhat_vals))], na.rm = TRUE)
+cat(sprintf("\n  r_player (max)                      %.4f  [%s]\n",
+            rhat_re_max,
+            if (rhat_re_max < 1.01) "OK" else "ISSUE"))
+
+cat("\nESS Ratio (target > 0.10):\n")
+walk(pop_params, ~ cat(sprintf(
+  "  %-35s %.3f  [%s]\n", .x, ess_vals[.x],
+  if (!is.na(ess_vals[.x]) && ess_vals[.x] > 0.1) "OK" else "LOW"
+)))
+
+n_div <- sum(nuts_params(fit, pars = "divergent__")$Value)
+cat(sprintf("\nDivergent transitions: %d%s\n", n_div,
+            if (n_div == 0) " — clean sample" else " — consider raising adapt_delta"))
+```
+
+```{r trace-plots}
+#| label: trace-plots
+#| fig-cap: "Trace plots for population-level parameters. Well-mixed chains (caterpillar appearance) confirm convergence."
+#| fig-height: 10
+
+bayesplot_theme_set(theme_minimal(base_size = 11))
+
+mcmc_trace(
+  as.array(fit, pars = pop_params),
+  facet_args = list(ncol = 2, labeller = label_parsed)
+) +
+  labs(title = "MCMC Trace Plots: Population-Level Parameters")
+```
+
+```{r}
+#| label: loo-comparison
+#| cache: true
+
+# Fit a simpler baseline model with no AR(1) lag and no delta_ttt.
+# If the full model's ELPD is meaningfully better, the added structure earns
+# its complexity. If not, the simpler model is preferred by the data.
+fit_simple <- suppressWarnings(brm(
+  formula = bf(
+    sacks | trials(trials_col) ~
+      avg_time_to_throw_std +
+      scramble_rate_std +
+      career_year_std +
+      starter_year_std +
+      (1 | player)
+  ),
+  data      = model_df,
+  family    = binomial(link = "logit"),
+  prior     = c(
+    prior(normal(-1.5, 0.3), class = "Intercept"),
+    prior(normal(0, 0.5),    class = "b"),
+    prior(normal(0, 0.2),    class = "sd")
+  ),
+  iter      = N_ITER,
+  warmup    = N_WARMUP,
+  chains    = N_CHAINS,
+  cores     = N_CHAINS,
+  control   = list(adapt_delta = ADAPT_DELTA),
+  seed      = RANDOM_SEED,
+  silent    = 2,
+  save_pars = save_pars(all = TRUE)
+))
+
+loo_full   <- loo(fit,        moment_match = TRUE)
+loo_simple <- loo(fit_simple, moment_match = TRUE)
+loo_comp   <- loo_compare(loo_simple, loo_full)
+
+cat("LOO-CV Model Comparison\n")
+cat(strrep("─", 60), "\n")
+print(loo_comp)
+cat("\n")
+
+elpd_diff  <- loo_comp[2, "elpd_diff"]
+elpd_se    <- loo_comp[2, "se_diff"]
+ratio      <- abs(elpd_diff) / elpd_se
+
+cat(sprintf("  ELPD difference (full − simple) : %.2f\n", -elpd_diff))
+cat(sprintf("  SE of difference                : %.2f\n",  elpd_se))
+cat(sprintf("  |diff| / SE                     : %.2f\n",  ratio))
+cat("\n  Interpretation:\n")
+cat("  |diff|/SE > 2 → AR(1) structure meaningfully improves predictive fit.\n")
+cat("  |diff|/SE < 2 → models are roughly equivalent; simpler model preferred.\n")
+cat("  Either result is informative: equivalence reinforces the finding that\n")
+cat("  stable between-player skill (the random intercept) dominates P2S\n")
+cat("  prediction, and the lag adds marginal value.\n")
+```
+
+```{r}
+#| label: holdout-coverage
+#| cache: true
+#| fig-cap: "2025 holdout coverage test. Each point is a QB's true 2025 P2S rate; the bar is the model's 80% credible interval trained on 2018–2024 only. Well-calibrated = ~80% of true values fall inside the bars."
+
+# Hold out 2025. Train on 2018–2024. Predict 2025 for QBs present in both.
+# This tests whether the model generalizes to an unseen season -- the same
+# generalization being claimed when projecting Caleb's 2026.
+
+train_df <- filter(model_df, season != 2025)
+test_df  <- filter(model_df, season == 2025)
+
+fit_holdout <- suppressWarnings(brm(
+  formula   = sack_formula,
+  data      = train_df,
+  family    = binomial(link = "logit"),
+  prior     = sack_priors,
+  iter      = N_ITER,
+  warmup    = N_WARMUP,
+  chains    = N_CHAINS,
+  cores     = N_CHAINS,
+  control   = list(adapt_delta = ADAPT_DELTA),
+  seed      = RANDOM_SEED,
+  silent    = 2,
+  save_pars = save_pars(all = TRUE)
+))
+
+# Posterior predictive draws for held-out 2025 observations
+ppd_holdout <- posterior_predict(
+  fit_holdout,
+  newdata           = test_df,
+  allow_new_levels  = TRUE,
+  sample_new_levels = "gaussian"
+)
+
+# Convert sack counts to P2S rate for each draw
+ppd_p2s <- sweep(ppd_holdout, 2, test_df$trials_col, "/") * 100
+
+# 80% credible interval coverage
+lo80 <- apply(ppd_p2s, 2, quantile, 0.10)
+hi80 <- apply(ppd_p2s, 2, quantile, 0.90)
+med  <- apply(ppd_p2s, 2, median)
+true <- test_df$pressure_to_sack_rate
+
+coverage_80 <- mean(true >= lo80 & true <= hi80)
+cat(sprintf(
+  "2025 holdout coverage (80%% CrI): %.1f%%  (target: ~80%%)\nn QBs in holdout: %d\n",
+  coverage_80 * 100, nrow(test_df)
+))
+
+# Plot: show each QB's true value vs predicted interval
+holdout_plot_df <- tibble(
+  player = test_df$player,
+  true   = true,
+  med    = med,
+  lo80   = lo80,
+  hi80   = hi80,
+  inside = true >= lo80 & true <= hi80
+) |>
+  arrange(med) |>
+  mutate(player = factor(player, levels = player))
+
+caleb_holdout <- filter(holdout_plot_df, player == "Caleb Williams")
+
+ggplot(holdout_plot_df, aes(y = player)) +
+  geom_linerange(aes(xmin = lo80, xmax = hi80, color = inside),
+                 linewidth = 1.2, alpha = 0.7) +
+  geom_point(aes(x = med), color = "white", size = 1.5) +
+  geom_point(aes(x = true, color = inside), shape = 4, size = 2.5, stroke = 1.2) +
+  geom_linerange(data = caleb_holdout,
+                 aes(xmin = lo80, xmax = hi80),
+                 color = "#e84855", linewidth = 2.0) +
+  geom_point(data = caleb_holdout, aes(x = true),
+             color = "#e84855", shape = 4, size = 4, stroke = 1.8) +
+  scale_color_manual(values = c("TRUE" = "#3bb273", "FALSE" = "#e84855"),
+                     labels = c("TRUE" = "Inside 80% CrI", "FALSE" = "Outside 80% CrI"),
+                     name   = NULL) +
+  geom_vline(xintercept = pop_mean, color = "gold",
+             linetype = "dotted", linewidth = 0.8) +
+  annotate("text", x = Inf, y = Inf,
+           label = sprintf("Coverage: %.1f%%\n(target ~80%%)", coverage_80 * 100),
+           hjust = 1.1, vjust = 1.5, size = 4, fontface = "bold",
+           color = if (abs(coverage_80 - 0.80) < 0.10) "#3bb273" else "#e84855") +
+  labs(
+    x        = "Pressure-to-Sack Rate (%)",
+    y        = NULL,
+    title    = "2025 Holdout Coverage Test",
+    subtitle = "Bar = 80% predictive CrI (trained on 2018–2024) | × = true 2025 value | Red highlight = Caleb Williams"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.y    = element_text(size = 7),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+
+---
+
+# 9. Posterior Inference
+
+## 9.1 Fixed-Effect Coefficients
+
+```{r coef-forest}
+#| label: coef-forest
+#| fig-cap: "Posterior distributions of fixed-effect coefficients (80% and 95% credible intervals). The AR(1) lag is the key structural parameter — its mass near zero is a central finding."
+
+beta_params <- c("b_p2s_lag_std", "b_delta_ttt_std", "b_avg_time_to_throw_std",
+                 "b_scramble_rate_std", "b_career_year_std", "b_starter_year_std")
+beta_labels <- c("P2S Lag (t−1)", "Δ Time to Throw", "Avg Time to Throw",
+                 "Scramble Rate", "Career Year", "Starter Year")
+
+mcmc_areas(
+  as.array(fit, pars = beta_params),
+  prob = 0.80, prob_outer = 0.95, point_est = "median"
+) +
+  geom_vline(xintercept = 0, color = "red",
+             linetype = "dashed", linewidth = 0.8) +
+  scale_y_discrete(labels = rev(beta_labels)) +
+  labs(
+    title    = "Posterior Fixed-Effect Coefficients",
+    subtitle = "Positive = higher sack probability given pressure | All covariates standardized",
+    x        = "Coefficient (logit scale)"
+  )
+
+fixef_tbl <- fixef(fit, probs = c(0.025, 0.10, 0.90, 0.975)) |>
+  as.data.frame() |>
+  rownames_to_column("parameter")
+
+cat("\nFixed-effect posterior summary:\n")
+print(fixef_tbl)
+```
+
+## 9.2 Shrinkage
+
+```{r shrinkage}
+#| label: shrinkage
+#| fig-cap: "Bayesian shrinkage: raw career-average P2S vs. posterior mean. QBs with fewer seasons are pulled more strongly toward the league mean (gold dotted line)."
+
+raw_p2s  <- model_df |>
+  group_by(player) |>
+  summarise(raw_p2s = mean(pressure_to_sack_rate), .groups = "drop")
+
+qb_coef      <- coef(fit, summary = TRUE)$player
+post_p2s_df  <- tibble(
+  player       = rownames(qb_coef),
+  posterior_p2s = plogis(qb_coef[, "Estimate", "Intercept"]) * 100
+)
+
+shrinkage_df <- left_join(raw_p2s, post_p2s_df, by = "player")
+caleb_shrink <- filter(shrinkage_df, player == "Caleb Williams")
+lim          <- range(c(shrinkage_df$raw_p2s, shrinkage_df$posterior_p2s),
+                      na.rm = TRUE) + c(-1, 1)
+
+ggplot(shrinkage_df, aes(x = raw_p2s, y = posterior_p2s)) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "black", alpha = 0.4) +
+  geom_hline(yintercept = pop_mean, color = "gold",
+             linetype = "dotted", linewidth = 1.2) +
+  geom_point(color = "#1a3a5c", alpha = 0.55, size = 2.5) +
+  geom_point(data = caleb_shrink, color = "#e84855", size = 5) +
+  geom_text(data = caleb_shrink, aes(label = "Caleb Williams"),
+            nudge_x = 0.3, nudge_y = -0.5,
+            color = "#e84855", fontface = "bold", size = 3.5, hjust = 0) +
+  coord_equal(xlim = lim, ylim = lim) +
+  labs(
+    x        = "Raw Observed P2S Rate — Career Average (%)",
+    y        = "Posterior Mean Estimate (%)",
+    title    = "Bayesian Shrinkage: Raw vs. Model-Estimated P2S Rate",
+    subtitle = "All QBs shrink toward the league mean (gold dotted); extent depends on sample size"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## 9.3 Caleb Williams Posterior Skill Distribution
+
+```{r caleb-posterior}
+#| label: caleb-posterior
+#| fig-cap: "Caleb Williams posterior distribution of true sack avoidance skill. The model's best estimate of his 'true talent' P2S rate, accounting for partial pooling across the QB population."
+
+post_arr      <- as.array(fit)
+b_int_vec     <- as.vector(post_arr[,, "b_Intercept"])
+caleb_re_vec  <- as.vector(post_arr[,, "r_player[Caleb.Williams,Intercept]"])
+caleb_p2s_vec <- plogis(b_int_vec + caleb_re_vec) * 100
+
+hdi_80       <- quantile2(caleb_p2s_vec, probs = c(0.10, 0.90))
+hdi_95       <- quantile2(caleb_p2s_vec, probs = c(0.025, 0.975))
+caleb_median <- median(caleb_p2s_vec)
+
+caleb_yr1_p2s <- panel |>
+  filter(player_id == CALEB_ID) |>
+  arrange(season) |>
+  slice(1) |>
+  pull(pressure_to_sack_rate)
+
+caleb_yr2_p2s <- panel |>
+  filter(player_id == CALEB_ID) |>
+  arrange(season) |>
+  slice(2) |>
+  pull(pressure_to_sack_rate)
+
+ggplot(tibble(x = caleb_p2s_vec), aes(x = x)) +
+  annotate("rect", xmin = hdi_95[1], xmax = hdi_95[2],
+           ymin = -Inf, ymax = Inf, fill = "steelblue", alpha = 0.10) +
+  annotate("rect", xmin = hdi_80[1], xmax = hdi_80[2],
+           ymin = -Inf, ymax = Inf, fill = "steelblue", alpha = 0.20) +
+  geom_histogram(aes(y = after_stat(density)), bins = 60,
+                 fill = "#1a3a5c", alpha = 0.85,
+                 color = "white", linewidth = 0.2) +
+  geom_vline(xintercept = caleb_median, color = "white",
+             linewidth = 1.5, linetype = "dashed") +
+  geom_vline(xintercept = pop_mean, color = "gold",
+             linewidth = 1.2, linetype = "dotted") +
+  geom_vline(xintercept = caleb_yr1_p2s, color = "#e84855", linewidth = 1.3) +
+  geom_vline(xintercept = caleb_yr2_p2s, color = "#3bb273", linewidth = 1.3) +
+  annotate("text", x = caleb_yr1_p2s + 0.2, y = Inf,
+           label = sprintf("2024: %.1f%%", caleb_yr1_p2s),
+           hjust = 0, vjust = 1.5, color = "#e84855", size = 3.2) +
+  annotate("text", x = caleb_yr2_p2s - 0.2, y = Inf,
+           label = sprintf("2025: %.1f%%", caleb_yr2_p2s),
+           hjust = 1, vjust = 3.0, color = "#3bb273", size = 3.2) +
+  annotate("text", x = caleb_median + 0.2, y = Inf,
+           label = sprintf("Posterior median\n%.1f%%", caleb_median),
+           hjust = 0, vjust = 1.5, color = "white", size = 3.2, fontface = "bold") +
+  labs(
+    x        = "Pressure-to-Sack Rate (%)",
+    y        = "Density",
+    title    = "Caleb Williams: Posterior Distribution of True Sack Avoidance Skill",
+    subtitle = sprintf(
+      "Light blue = 80%% CrI [%.1f%%, %.1f%%] | 95%% CrI [%.1f%%, %.1f%%] | Gold dotted = league mean (%.1f%%)",
+      hdi_80[1], hdi_80[2], hdi_95[1], hdi_95[2], pop_mean
+    )
+  ) +
+  theme_minimal(base_size = 12)
+
+cat(sprintf(
+  "Posterior median : %.2f%%\n80%% CrI          : [%.2f%%, %.2f%%]\n95%% CrI          : [%.2f%%, %.2f%%]\nLeague mean      : %.2f%%\n",
+  caleb_median, hdi_80[1], hdi_80[2], hdi_95[1], hdi_95[2], pop_mean
+))
+```
+
+---
+
+# 10. What the Data Is Telling Us
+
+The AR(1) lag coefficient is the model's answer to the question: *once stable
+between-player differences are controlled, how much does last season's P2S rate
+predict this season's?*
+
+```{r key-finding}
+#| label: key-finding
+
+post_draws_df  <- as_draws_df(fit)
+lag_coef_draws <- post_draws_df$b_p2s_lag_std
+p_lag_pos      <- mean(lag_coef_draws > 0) * 100
+lag_median     <- median(lag_coef_draws)
+
+cat(sprintf(
+  "Core finding summary\n%s\n  Lag-1 autocorrelation (raw, unadjusted) : r = %.3f\n  AR(1) lag coefficient (model)           : %.4f\n  P(β_lag > 0)                            : %.1f%%\n  Population YoY change SD               : %.2f pp\n  Caleb Year1→Year2 change               : %.1f pp  (%.1f SDs from zero)\n",
+  strrep("─", 60), lag1_cor, lag_median, p_lag_pos,
+  yoy_sd, caleb_yoy$p2s_change, caleb_z
+))
+
+cat(sprintf(
+  "\nInterpretation\n%s\nThe raw lag-1 correlation of %.3f suggests modest persistence,\n",
+  strrep("─", 60), lag1_cor
+))
+cat("but once the model controls for stable between-player differences via\n")
+cat("random intercepts, the residual year-to-year signal collapses.\n")
+cat(sprintf("P(β_lag > 0) = %.1f%% means the data actively favors β_lag ≤ 0:\n", p_lag_pos))
+cat("most of the apparent cross-sectional persistence was driven by\n")
+cat("consistent inter-player differences, not genuine autocorrelation.\n\n")
+cat("What this means for Caleb:\n")
+cat(sprintf(
+  "  His Year 1 (28.2%%) and Year 2 (9.6%%) are both used to identify his\n  player random intercept. Because the lag carries negligible weight,\n  his posterior skill estimate (~%.0f%%) sits below his raw two-season\n  average (~%.1f%%).\n\n",
+  caleb_median, mean(c(caleb_yr1_p2s, caleb_yr2_p2s))
+))
+cat(sprintf(
+  "  His Year 1→Year 2 swing of %.1f pp is %.1f SDs from the population\n",
+  caleb_yoy$p2s_change, abs(caleb_z)
+))
+cat("  mean change — one of the most extreme improvements in the 8-year\n")
+cat("  dataset. The model treats some of that swing as genuine signal\n")
+cat("  (absorbed into his player intercept) and some as noise. This is\n")
+cat("  the correct Bayesian response to an extreme single-season result.\n")
+```
+
+```{r persistence-plot}
+#| label: persistence-plot
+#| fig-cap: "Posterior distribution of the AR(1) lag coefficient. Mass concentrated left of zero confirms that year-to-year P2S changes are largely noise once between-player differences are controlled."
+
+ggplot(tibble(beta = lag_coef_draws), aes(x = beta)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 60,
+                 fill = "#1a3a5c", alpha = 0.85,
+                 color = "white", linewidth = 0.2) +
+  geom_vline(xintercept = 0, color = "red",
+             linetype = "dashed", linewidth = 1.0) +
+  geom_vline(xintercept = lag_median, color = "gold",
+             linewidth = 1.2, linetype = "dotted") +
+  annotate("text", x = lag_median + 0.003, y = Inf,
+           label = sprintf("Median: %.3f\nP(β > 0) = %.1f%%",
+                           lag_median, p_lag_pos),
+           hjust = 0, vjust = 1.4, color = "gold",
+           size = 3.5, fontface = "bold") +
+  labs(
+    x        = "AR(1) Lag Coefficient (standardized logit scale)",
+    y        = "Density",
+    title    = "Posterior of the AR(1) Lag Coefficient",
+    subtitle = paste0(
+      "Mass concentrated left of zero: prior-season P2S adds little predictive power\n",
+      "once stable between-player differences are controlled via random intercepts."
+    )
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+# 11. Year 3 (2026) Projection
+
+Because the lag coefficient is near zero, the Year 3 projection is driven
+almost entirely by Caleb's player random intercept (estimated true talent) and
+career development terms. Three ΔTTT scenarios are reported but their medians
+differ by less than 0.5 percentage points — **the neutral scenario (ΔTTT = 0)
+is the primary result.**
+
+```{r year3-projection}
+#| label: year3-projection
+
+caleb_yr2_row <- model_df |>
+  filter(player_id == CALEB_ID) |>
+  slice_tail(n = 1)
+
+career_yr3  <- 3L
+starter_yr3 <- 3L
+lag_yr3     <- caleb_yr2_row$pressure_to_sack_rate
+ttt_yr3     <- caleb_yr2_row$avg_time_to_throw
+scr_yr3     <- caleb_yr2_row$scramble_rate
+
+# Standardize Year 3 covariates
+lag_std <- (lag_yr3     - LAG_MU)  / LAG_SIG
+ttt_std <- (ttt_yr3     - TTT_MU)  / TTT_SIG
+scr_std <- (scr_yr3     - SCR_MU)  / SCR_SIG
+cyr_std <- (career_yr3  - CYR_MU)  / CYR_SIG
+syr_std <- (starter_yr3 - SYR_MU)  / SYR_SIG
+
+# Three ΔTTT scenarios (standardized)
+dttt_scenarios <- c(
+  "Neutral (ΔTTT = 0.00 sec)"      =  (0.00 - DTTT_MU) / DTTT_SIG,
+  "Regression (ΔTTT = +0.15 sec)"  =  (0.15 - DTTT_MU) / DTTT_SIG,
+  "Improvement (ΔTTT = −0.15 sec)" = (-0.15 - DTTT_MU) / DTTT_SIG
+)
+
+# Extract posterior draws
+b_int_v    <- post_draws_df$b_Intercept
+b_lag_v    <- post_draws_df$b_p2s_lag_std
+b_dttt_v   <- post_draws_df$b_delta_ttt_std
+b_ttt_v    <- post_draws_df$b_avg_time_to_throw_std
+b_scr_v    <- post_draws_df$b_scramble_rate_std
+b_cyr_v    <- post_draws_df$b_career_year_std
+b_syr_v    <- post_draws_df$b_starter_year_std
+caleb_re_v <- post_draws_df[["r_player[Caleb.Williams,Intercept]"]]
+
+project_yr3 <- function(dttt_std) {
+  plogis(
+    b_int_v + caleb_re_v +
+      b_lag_v  * lag_std +
+      b_dttt_v * dttt_std +
+      b_ttt_v  * ttt_std +
+      b_scr_v  * scr_std +
+      b_cyr_v  * cyr_std +
+      b_syr_v  * syr_std
+  ) * 100
+}
+
+proj_samples <- map(dttt_scenarios, project_yr3)
+neutral_samp <- proj_samples[["Neutral (ΔTTT = 0.00 sec)"]]
+
+cat(sprintf(
+  "PRIMARY RESULT — Neutral scenario (ΔTTT = 0)\n%s\n  Median         : %.1f%%\n  80%% CrI        : [%.1f%%, %.1f%%]\n  95%% CrI        : [%.1f%%, %.1f%%]\n",
+  strrep("─", 50),
+  median(neutral_samp),
+  quantile(neutral_samp, 0.10), quantile(neutral_samp, 0.90),
+  quantile(neutral_samp, 0.025), quantile(neutral_samp, 0.975)
+))
+
+cat(sprintf("\n  P(Year 3 P2S < Year 2 actual of %.1f%%)  : %.1f%%\n",
+            lag_yr3, mean(neutral_samp < lag_yr3) * 100))
+cat(sprintf("  P(Year 3 P2S < league mean of %.1f%%)    : %.1f%%\n",
+            pop_mean, mean(neutral_samp < pop_mean) * 100))
+cat(sprintf("  P(Year 3 P2S > 25%% [above average])     : %.1f%%\n",
+            mean(neutral_samp > 25) * 100))
+
+cat(sprintf("\nAll scenarios (note: spread < 0.5 pp — ΔTTT has minimal leverage)\n%s\n",
+            strrep("─", 75)))
+cat(sprintf("  %-40s  %5s  %5s  %5s\n", "Scenario", "p10", "p50", "p90"))
+cat(strrep("─", 75), "\n")
+iwalk(proj_samples, ~ cat(sprintf(
+  "  %-40s  %4.1f%%  %4.1f%%  %4.1f%%\n",
+  .y, quantile(.x, 0.10), median(.x), quantile(.x, 0.90)
+)))
+```
+
+```{r projection-plot}
+#| label: projection-plot
+#| fig-cap: "Year 3 (2026) posterior predictive projection. The near-identical distributions across all three scenarios confirm that ΔTTT has negligible leverage once individual skill is controlled — the neutral scenario (blue) is the primary result."
+
+scenario_colors <- c("#4fa3e0", "#e84855", "#3bb273")
+
+proj_df <- imap_dfr(proj_samples, ~ tibble(scenario = .y, x = .x)) |>
+  mutate(scenario = factor(scenario, levels = names(dttt_scenarios)))
+
+proj_medians <- proj_df |>
+  group_by(scenario) |>
+  summarise(med = median(x), .groups = "drop")
+
+neutral_med <- proj_medians$med[proj_medians$scenario == "Neutral (ΔTTT = 0.00 sec)"]
+
+ggplot(proj_df, aes(x = x, fill = scenario, color = scenario)) +
+  geom_density(alpha = 0.20, linewidth = 0.6) +
+  geom_density(
+    data    = filter(proj_df, scenario == "Neutral (ΔTTT = 0.00 sec)"),
+    aes(x = x), color = "#4fa3e0", linewidth = 1.8,
+    fill = "#4fa3e0", alpha = 0.25, inherit.aes = FALSE
+  ) +
+  geom_vline(data = proj_medians,
+             aes(xintercept = med, color = scenario), linewidth = 1.2) +
+  geom_vline(xintercept = pop_mean, color = "gold",
+             linetype = "dotted", linewidth = 1.2) +
+  geom_vline(xintercept = lag_yr3, color = "grey40",
+             linetype = "dashed", linewidth = 0.9) +
+  annotate("text", x = lag_yr3 - 0.2, y = Inf,
+           label = sprintf("Year 2 actual: %.1f%%", lag_yr3),
+           hjust = 1, vjust = 1.5, color = "grey30", size = 3.2) +
+  annotate("text", x = neutral_med, y = Inf,
+           label = sprintf("Primary result\n%.1f%%", neutral_med),
+           hjust = 0.5, vjust = 3.5,
+           color = "#4fa3e0", size = 3.5, fontface = "bold") +
+  scale_fill_manual(values  = setNames(scenario_colors, levels(proj_df$scenario))) +
+  scale_color_manual(values = setNames(scenario_colors, levels(proj_df$scenario))) +
+  labs(
+    x        = "Projected Year 3 Pressure-to-Sack Rate (%)",
+    y        = "Density",
+    title    = "Caleb Williams: Year 3 (2026) Posterior Predictive Projection",
+    subtitle = sprintf(
+      "Gold dotted = league mean (%.1f%%) | Grey dashed = Year 2 actual (%.1f%%)\nScenario spread < 0.5 pp — ΔTTT has minimal leverage once skill is controlled.",
+      pop_mean, lag_yr3
+    ),
+    fill  = "ΔTTT Scenario",
+    color = "ΔTTT Scenario"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", legend.direction = "vertical")
+```
+
+## 11.1 Projected Sack Counts
+
+```{r sack-counts}
+#| label: sack-counts
+
+assumed_pressures <- c(200L, 240L, 280L)
+
+cat(sprintf("Projected sack counts by pressure volume (Median [p10–p90])\n%s\n",
+            strrep("─", 80)))
+cat(sprintf("  %-42s", "Scenario"))
+walk(assumed_pressures, ~ cat(sprintf("  %d pressures", .x)))
+cat(sprintf("\n  %s\n", strrep("─", 75)))
+
+iwalk(proj_samples, function(samp, nm) {
+  cat(sprintf("  %-42s", nm))
+  walk(assumed_pressures, function(p) {
+    draws <- rbinom(length(samp), size = p, prob = samp / 100)
+    cat(sprintf("  %2d [%2d–%2d]",
+                round(median(draws)),
+                round(quantile(draws, 0.10)),
+                round(quantile(draws, 0.90))))
+  })
+  cat("\n")
+})
+```
+
+---
+
+# 12. Limitations
+
+**Scheme confound (most significant).** Ben Johnson's arrival in Chicago
+materially changed Caleb's operating environment: faster tempo, pre-snap
+motion, and shorter intended release windows all reduce P2S independently of
+QB skill. `avg_time_to_throw` and `delta_ttt` partially absorb this confound,
+but both are themselves scheme-driven. Isolating QB skill from coordinator
+quality would require a coach fixed effect or scheme-quality control variable.
+
+**Two seasons, one lag transition.** Caleb contributes exactly one
+lag-to-current observation (2024→2025) to the AR(1) model. His random intercept
+is identified primarily by the population prior and this single transition.
+Year 3 data will be the first season where his individual intercept is
+meaningfully constrained by his own history.
+
+**AR(1) structure excludes first seasons.** Each QB's first qualifying season
+cannot enter the model as a response — it serves as the lag for their second
+season. This reduces the modeling sample from ~333 to ~231 QB-seasons and
+excludes QBs with only one qualifying season. The tradeoff is accepted given
+the structural value of the lag term.
+
+**Pressure volume is assumed, not modeled.** Projecting sack counts requires
+an assumption about how many pressures Caleb will face in 2026. This is
+itself uncertain and is reported across a plausible range (200–280 pressures)
+rather than as a single forecast.
+
+**OL quality residual.** P2S rate controls for OL quality better than raw sack
+count, but OL quality also affects *pressure type* — a strong OL may generate
+cleaner, more escapable pressures than stunt-heavy designs allowed by a weaker
+line. This residual confound cannot be removed without play-level data.
+
+---
+
+# 13. Session Info
+
+```{r session-info}
+#| label: session-info
+
+session_pkgs <- c("brms", "tidybayes", "posterior", "bayesplot",
+                  "nflreadr", "tidyverse", "stringdist")
+
+cat(sprintf("R: %s\n", R.version.string))
+walk(session_pkgs, ~ cat(sprintf("  %-12s %s\n", .x, packageVersion(.x))))
+
+if (requireNamespace("cmdstanr", quietly = TRUE)) {
+  tryCatch(
+    cat(sprintf("  %-12s %s\n", "CmdStan", cmdstanr::cmdstan_version())),
+    error = function(e) cat("  CmdStan      (not installed)\n")
+  )
+}
+```
